@@ -1,71 +1,90 @@
 // index.js
 const { Client, GatewayIntentBits } = require('discord.js');
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const schedule = require('node-schedule');
+require('dotenv').config();
 
-// ---------- 環境変数 ----------
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID; // 通知したいチャンネルID
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
-// ---------- FB設定 ----------
-const FBs = [
-    { name: "コインブラ", intervalHours: 10, startDay: 3, startHour: 4 }, // 水曜4:00
-    { name: "オーシュ", intervalHours: 21, startDay: 3, startHour: 4 }  // 水曜4:00
-];
+// Discord環境変数にBOTトークンと通知チャンネルIDを設定しておく
+// DISCORD_TOKEN, CHANNEL_ID
 
-const MS_PER_MIN = 60 * 1000;
-const MS_PER_HOUR = 60 * MS_PER_MIN;
+const channelId = process.env.CHANNEL_ID;
 
-// ---------- ヘルパー ----------
-function getNextOccurrences(fb) {
+// 出現間隔（分単位）
+const COIMBRA_INTERVAL = 10 * 60; // 10時間 → 600分
+const ORCHE_INTERVAL = 21 * 60;   // 21時間 → 1260分
+
+// 火曜10:00メンテ後リセットのためのスケジュール
+function generateSchedules() {
+    const schedules = { coimbra: [], orche: [] };
+    
+    // 水曜04:00起点
     const now = new Date();
-    // 基準日を今週水曜 4:00 に固定
-    const base = new Date(now);
-    base.setHours(fb.startHour, 0, 0, 0);
-    const dayDiff = (fb.startDay - base.getDay() + 7) % 7;
-    base.setDate(base.getDate() + dayDiff);
-
-    let occurrences = [];
-    let next = new Date(base);
-    while (occurrences.length < 5) { // 未来5個分
-        if (next > now) occurrences.push(new Date(next));
-        next = new Date(next.getTime() + fb.intervalHours * MS_PER_HOUR);
+    let start = new Date(now);
+    start.setHours(4, 0, 0, 0); // 水曜04:00に設定
+    while (start.getDay() !== 3) { // 水曜まで進める
+        start.setDate(start.getDate() + 1);
     }
-    return occurrences;
+
+    // コインブラスケジュール作成（10時間間隔）
+    let coimbraTime = new Date(start);
+    while (coimbraTime.getDate() <= start.getDate() + 7) {
+        schedules.coimbra.push(new Date(coimbraTime));
+        coimbraTime = new Date(coimbraTime.getTime() + COIMBRA_INTERVAL * 60000);
+    }
+
+    // オーシュスケジュール作成（21時間間隔）
+    let orcheTime = new Date(start);
+    while (orcheTime.getDate() <= start.getDate() + 7) {
+        schedules.orche.push(new Date(orcheTime));
+        orcheTime = new Date(orcheTime.getTime() + ORCHE_INTERVAL * 60000);
+    }
+
+    return schedules;
 }
 
-// ---------- Discord起動 ----------
-client.once('ready', () => {
-    console.log(`Logged in as ${client.user.tag}`);
-
-    const channel = client.channels.cache.get(CHANNEL_ID);
+// Discordチャンネルにメッセージ送信
+async function sendMessage(message) {
+    const channel = await client.channels.fetch(channelId);
     if (!channel) {
-        console.error("指定チャンネルが見つかりません");
+        console.log('指定チャンネルが見つかりません');
         return;
     }
+    channel.send(message);
+}
+
+// 通知スケジューリング
+function scheduleNotifications() {
+    const schedules = generateSchedules();
 
     // 0時通知
-    setInterval(() => {
-        const now = new Date();
-        if (now.getHours() === 0 && now.getMinutes() === 0) {
-            FBs.forEach(fb => {
-                const next = getNextOccurrences(fb)[0];
-                channel.send(`本日${next.getMonth()+1}月${next.getDate()}日の\n${fb.name} FB予定時刻は${next.getHours().toString().padStart(2,'0')}:${next.getMinutes().toString().padStart(2,'0')}です。`);
-            });
-        }
-    }, 60 * 1000); // 1分ごとチェック
+    schedule.scheduleJob('0 0 * * *', async () => {
+        const today = new Date();
+        const coimbraToday = schedules.coimbra.filter(d => d.getDate() === today.getDate());
+        const orcheToday = schedules.orche.filter(d => d.getDate() === today.getDate());
+
+        let msg = `本日 ${today.getMonth()+1}月${today.getDate()}日のFB予定時刻:\n`;
+        if (coimbraToday.length) msg += `コインブラ: ${coimbraToday.map(d => d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')).join(', ')}\n`;
+        if (orcheToday.length) msg += `オーシュ: ${orcheToday.map(d => d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')).join(', ')}`;
+
+        await sendMessage(msg);
+    });
 
     // 出現5分前通知
-    setInterval(() => {
-        const now = new Date();
-        FBs.forEach(fb => {
-            const next = getNextOccurrences(fb)[0];
-            const diffMin = (next - now) / MS_PER_MIN;
-            if (diffMin > 4.9 && diffMin < 5.1) { // 5分前 ±0.1分
-                channel.send(`オーシュFB出現\n5分前のお知らせです。`);
-            }
+    [...schedules.coimbra, ...schedules.orche].forEach(time => {
+        const notifyTime = new Date(time.getTime() - 5 * 60000);
+        schedule.scheduleJob(notifyTime, async () => {
+            const loc = schedules.coimbra.includes(time) ? 'コインブラ' : 'オーシュ';
+            await sendMessage(`${loc} FB出現 5分前のお知らせです。`);
         });
-    }, 30 * 1000); // 30秒ごとチェック
+    });
+
+    console.log('通知スケジュール完了');
+}
+
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}`);
+    scheduleNotifications();
 });
 
-// ---------- ログイン ----------
-client.login(DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN);
